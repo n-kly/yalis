@@ -26,6 +26,10 @@ from kvcache_manager import KVCacheManager
 from yalis.attention.flash import flash_apply_rotary as apply_rotary
 from yalis.attention.backends import AttentionBackend
 from yalis.attention.masking import create_causal_block_mask_for_flex_attention
+from yalis.attention.utils import fit_powerlaw_linreg_torch
+from yalis.attention.nowmp_thresh.threshold_attention_nowmp import (
+    init_nowmp_state,
+)
 
 # TODO: these should be dynamically set during engine initialization
 NUM_BLOCKS, PAGE_BLOCK_SIZE = 512, 256
@@ -119,6 +123,7 @@ class GPT(nn.Module):
         input_ids: torch.Tensor,
         phase: EnginePhase,
         actual_sequence_lengths: torch.Tensor = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         idx = input_ids
         T = idx.size(1)
@@ -195,6 +200,8 @@ class GPT(nn.Module):
                 self.token_counter,
                 block_table,
                 flex_attention_block_mask,
+                self.generation_counter,
+                warmup=warmup,
             )
         if self.config.tensor_parallel:
             x = Gather.apply(
@@ -210,6 +217,8 @@ class GPT(nn.Module):
         self.token_counter[:B].add_(
             T if actual_sequence_lengths is None else actual_sequence_lengths
         )
+        if hasattr(self, "generation_counter"):
+            self.generation_counter[:B].add_(1)
         if self.config.use_paged_kv_caching:
             # NOTE: Paged KV: readjusting the token counters of the block table
             # to exclude padded tokens.
@@ -307,6 +316,38 @@ class GPT(nn.Module):
 
         max_tokens = max_seq_length * max_batch_size
 
+        sorted_channels = None
+        heavy_const = None
+        heavy_channel_num = None
+        q_heads = None
+        if self.config.attention_backend == AttentionBackend.DOUBLE_SPARSE:
+            from yalis.attention.double_sparse import (
+                load_channel_config,
+                init_double_sparse_state,
+                resolve_double_sparse_config,
+            )
+
+            q_heads = self.config.n_head
+            kv_heads = self.config.n_query_groups
+            heavy_channel_num, heavy_const = resolve_double_sparse_config(
+                head_dim=self.config.head_size,
+                max_seq_length=max_seq_length,
+                sparsity=self.config.double_sparse_sparsity,
+                heavy_channel_num=self.config.double_sparse_heavy_channel_num,
+                heavy_const=self.config.double_sparse_heavy_const,
+            )
+            if self.config.double_sparse_channel_config_path is None:
+                raise ValueError(
+                    "double_sparse requires double_sparse_channel_config_path."
+                )
+            sorted_channels = load_channel_config(
+                self.config.double_sparse_channel_config_path,
+                n_layers=len(self.transformer.h),
+                channel_type=self.config.double_sparse_channel_type,
+                heavy_channel_num=heavy_channel_num,
+                device=device if device is not None else torch.device("cuda"),
+            )
+
         # TODO (Prajwal): This is a hack to not over allocated
         # KV-cache by default.Fix with dynamic page calculation logic
         global NUM_BLOCKS
@@ -316,7 +357,7 @@ class GPT(nn.Module):
                 NUM_BLOCKS = 1024
 
         # initialize the kv cache for all blocks
-        for block in self.transformer.h:
+        for idx, block in enumerate(self.transformer.h):
             block.attn.kv_cache = block.attn.build_kv_cache(
                 max_batch_size,
                 max_seq_length,
@@ -324,6 +365,31 @@ class GPT(nn.Module):
                 device,
                 dtype,
             )
+            heads = block.attn.config.n_head
+            num_warmup_steps = getattr(self.config, "num_warmup_steps", 64)
+            block.attn.warmup_quantiles = torch.zeros(
+                max_batch_size,
+                heads,
+                num_warmup_steps,
+                dtype=dtype,
+                device=device,
+            )
+            if self.config.attention_backend == AttentionBackend.THRESH_ATTN_NOWMP:
+                block.attn.nowmp_state = init_nowmp_state(
+                    max_batch_size, heads, device=device
+                )
+            if self.config.attention_backend == AttentionBackend.DOUBLE_SPARSE:
+                block.attn.double_sparse_state = init_double_sparse_state(
+                    batch_size=max_batch_size,
+                    max_seq_length=max_seq_length,
+                    heads=q_heads if q_heads is not None else heads,
+                    head_dim=self.config.head_size,
+                    heavy_const=heavy_const,
+                    heavy_channel_num=heavy_channel_num,
+                    sorted_channel=sorted_channels[idx],
+                    device=device if device is not None else torch.device("cuda"),
+                    dtype=dtype,
+                )
         if self.config.use_paged_kv_caching:
             self.kv_cache_manager = KVCacheManager(
                 max_batch_size,
@@ -342,6 +408,9 @@ class GPT(nn.Module):
         self.token_counter = torch.zeros(
             max_batch_size, device=device, dtype=torch.int32
         )
+        self.generation_counter = torch.zeros(
+            max_batch_size, device=device, dtype=torch.int32
+        )
 
     def rewind_kv_cache(self, num_tokens: torch.Tensor) -> None:
         """
@@ -355,6 +424,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.kv_cache = None
         torch.cuda.empty_cache()
+
+    def fit_powerlaw(self):
+        for block in self.transformer.h:
+            block.attn.fit_power_law()
 
     def create_symmetric_memory_pool(
         self,
@@ -435,6 +508,8 @@ class Block(nn.Module):
         token_counter: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
         flex_attention_block_mask=None,
+        generation_counter: Optional[torch.Tensor] = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -466,6 +541,8 @@ class Block(nn.Module):
             token_counter,
             block_table,
             flex_attention_block_mask,
+            generation_counter,
+            warmup=warmup,
         )
         attention_output = self.post_attention_norm(attention_output)
 
@@ -524,6 +601,15 @@ class CausalSelfAttention(nn.Module):
             and block_idx % config.sliding_window_layer_placing == 0
         )
 
+        # Used by threshold and sparse attention backends
+        self.warmup_quantiles = None
+        self.threshold_percentile = getattr(config, "threshold_percentile", 0.0)
+        self.num_warmup_steps = getattr(config, "num_warmup_steps", 64)
+        self.powerlaw_a = None
+        self.powerlaw_b = None
+        self.nowmp_state = None
+        self.double_sparse_state = None
+
         if config.norm_qk:
             assert config.norm_qk_type == "default"
 
@@ -567,6 +653,24 @@ class CausalSelfAttention(nn.Module):
                 assert self.config.n_query_groups % attention_world_size == 0
                 self.config.n_query_groups //= attention_world_size
 
+    def fit_power_law(self):
+        if self.config.attention_backend == AttentionBackend.THRESH:
+            x = torch.arange(
+                0,
+                self.num_warmup_steps,
+                dtype=self.warmup_quantiles.dtype,
+                device=self.warmup_quantiles.device,
+            ).unsqueeze(0).unsqueeze(0)
+            x = x.expand(
+                self.warmup_quantiles.size(0),
+                self.warmup_quantiles.size(1),
+                self.num_warmup_steps,
+            )
+            self.powerlaw_a, self.powerlaw_b, _ = fit_powerlaw_linreg_torch(
+                x,
+                self.warmup_quantiles,
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -576,6 +680,8 @@ class CausalSelfAttention(nn.Module):
         token_counter: torch.Tensor,
         block_table: torch.Tensor = None,
         flex_attention_block_mask=None,
+        generation_counter: Optional[torch.Tensor] = None,
+        warmup: bool = False,
     ) -> torch.Tensor:
         B, T, C = (
             x.size()
@@ -621,6 +727,10 @@ class CausalSelfAttention(nn.Module):
             k = k.transpose(1, 2).contiguous()
             v = v.transpose(1, 2).contiguous()
 
+        retain_perc = torch.zeros(
+            (B, 1), device=x.device, dtype=torch.float32
+        )
+
         # NOTE: Pass full k_cache, v_cache, and token_counter.
         # Slicing for current batch size is done in the respective backends.
         y = attention_wrapper(
@@ -638,6 +748,15 @@ class CausalSelfAttention(nn.Module):
             use_intra_head_parallelism=self.config.use_intra_head_parallelism,
             prestore_kv_cache=self.config.prestore_kv_cache,
             flex_attention_block_mask=flex_attention_block_mask,
+            generation_counter=generation_counter,
+            warmup_quantiles=self.warmup_quantiles,
+            warmup=warmup,
+            threshold_percentile=self.threshold_percentile,
+            retain_perc=retain_perc,
+            powerlaw_a=self.powerlaw_a,
+            powerlaw_b=self.powerlaw_b,
+            nowmp_state=self.nowmp_state,
+            double_sparse_state=self.double_sparse_state,
         )
 
         if not self.config.attention_backend == AttentionBackend.FLASH:

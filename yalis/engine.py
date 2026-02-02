@@ -14,6 +14,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from .constants import EnginePhase
+from .attention.backends import AttentionBackend
 import time
 import gc
 from .timers import Timers
@@ -67,6 +68,7 @@ def prefill(
     top_p=1.0,
     get_logits=False,
     phase: EnginePhase = EnginePhase.PREFILL,
+    warmup: bool = False,
 ):
     """
     Prefill function for generating the first token.
@@ -81,9 +83,9 @@ def prefill(
         logits: (Optional) The raw logits from the model.
     """
 
-    logits = model(tokens, phase, unpadded_prompt_lengths)["logits"].to(
-        torch.float32
-    )
+    logits = model(tokens, phase, unpadded_prompt_lengths, warmup=warmup)[
+        "logits"
+    ].to(torch.float32)
     logits = logits[torch.arange(logits.size(0)), unpadded_prompt_lengths - 1]
     token_id = sample(
         logits=logits, temperature=temperature, top_k=top_k, top_p=top_p
@@ -105,6 +107,7 @@ def generate(
     top_p=1.0,
     get_logits=False,
     phase: EnginePhase = EnginePhase.DECODE_SINGLE,
+    warmup: bool = False,
 ):
     """
     Generate function for producing the next token(s).
@@ -119,7 +122,7 @@ def generate(
         token_id: The next predicted token.
         logits: (Optional) The raw logits from the model.
     """
-    logits = model(tokens, phase)["logits"].to(torch.float32)
+    logits = model(tokens, phase, warmup=warmup)["logits"].to(torch.float32)
     token_id = sample(
         logits=logits[:, -1], temperature=temperature, top_k=top_k, top_p=top_p
     )
@@ -208,6 +211,7 @@ class LLMEngine:
         model = get_model(
             model_config.model_path,
             self.dtype,
+            inference_config=inference_config,
             max_sequence_length=inference_config.max_length,
             random_init=False,
             use_intra_head_parallelism=inference_config.use_intra_head_parallelism,  # noqa: E501
@@ -401,8 +405,14 @@ class LLMEngine:
         # Start timing the operations
         timers.start("generate")
         self.model.token_counter.zero_()
+        if hasattr(self.model, "generation_counter"):
+            self.model.generation_counter.zero_()
         if self.inference_config.use_paged_kv_caching:
             self.model.kv_cache_manager.reset()
+        is_thresh_backend = (
+            self.inference_config.attention_backend == AttentionBackend.THRESH
+        )
+        num_generation_step = 0
         with torch.inference_mode(), torch.autocast(
             self.device, dtype=self.dtype, cache_enabled=False
         ):
@@ -433,6 +443,12 @@ class LLMEngine:
                     timer_key = "decode"
                     timers.start(timer_key)
                     nvtx_range_push("Decode")
+                    warmup = False
+                    if is_thresh_backend:
+                        warmup = (
+                            num_generation_step
+                            <= self.inference_config.num_warmup_steps
+                        )
                     with sdpa_kernel(SDPBackend.MATH):
                         next_token, logits = generate(
                             self.model,
@@ -441,6 +457,7 @@ class LLMEngine:
                             top_k=self.inference_config.top_k,
                             top_p=self.inference_config.top_p,
                             get_logits=get_logits,
+                            warmup=warmup,
                         )  # Call generate function
 
                     current_input_to_model.copy_(
@@ -463,6 +480,14 @@ class LLMEngine:
                 if get_logits:
                     output_logits.append(logits.clone())
                 timers.stop(timer_key)
+
+                if is_thresh_backend and (
+                    num_generation_step
+                    == self.inference_config.num_warmup_steps
+                ):
+                    self.model.fit_powerlaw()
+
+                num_generation_step += 1
 
                 # Break if every sequence is done
                 if not ignore_eos and done_mask.all():

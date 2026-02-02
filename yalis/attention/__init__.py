@@ -22,6 +22,7 @@ def attention_wrapper(
     prestore_kv_cache: bool = True,
     backend: AttentionBackend = AttentionBackend.FLASH,
     flex_attention_block_mask=None,
+    **kwargs,
 ) -> torch.Tensor:
     fn = get_attention(backend.value)
     return fn(
@@ -38,4 +39,5 @@ def attention_wrapper(
         use_intra_head_parallelism=use_intra_head_parallelism,
         prestore_kv_cache=prestore_kv_cache,
         flex_attention_block_mask=flex_attention_block_mask,
+        **kwargs,
     )
