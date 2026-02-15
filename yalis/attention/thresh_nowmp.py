@@ -182,9 +182,14 @@ def thresh_attn_nowmp(
     use_intra_head_parallelism: bool = False,
     **kwargs,
 ):
-    assert "threshold_percentile" in kwargs, "nowmp attention requires a threshold percentile"
+    assert (
+        "threshold_percentile" in kwargs
+    ), "nowmp attention requires a threshold percentile"
     assert "retain_perc" in kwargs, "nowmp attention requires a retain percentage"
     assert "nowmp_state" in kwargs, "nowmp attention requires state tensors"
+    threshold_percentile = kwargs.pop("threshold_percentile")
+    retain_perc = kwargs.pop("retain_perc")
+    nowmp_state = kwargs.pop("nowmp_state")
     return threshold_attention_nowmp(
         q=q,
         k=k,
@@ -194,8 +199,8 @@ def thresh_attn_nowmp(
         cache_seqlens=cache_seqlens,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
-        threshold_percentile=kwargs["threshold_percentile"],
-        nowmp_state=kwargs["nowmp_state"],
-        retain_perc=kwargs["retain_perc"],
+        threshold_percentile=threshold_percentile,
+        nowmp_state=nowmp_state,
+        retain_perc=retain_perc,
         **kwargs,
     )

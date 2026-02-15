@@ -73,7 +73,14 @@ def lit_rotary_kv_update_gen(
     
     enable_gqa = q.size(1) != k.size(1)
     if warmup:
-        out, quantiles = thresh_attention_warmup_forward(q, k_cache, v_cache, threshold_percentile, attn_mask=mask[:, None, None, :], enable_gqa=enable_gqa)
+        out, quantiles = thresh_attention_warmup_forward(
+            q,
+            k_cache,
+            v_cache,
+            threshold_percentile,
+            attn_mask=mask[:, None, None, :],
+            enable_gqa=enable_gqa,
+        )
         g_indices = generation_counter.view(-1)
         #print (f"{g_indices.dtype=}, {warmup_quantiles.dtype=}, {quantiles.dtype=}")
         warmup_quantiles[b_indices, :, g_indices - 1] = quantiles[b_indices, :, 0].to(warmup_quantiles.dtype)

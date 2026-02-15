@@ -38,14 +38,40 @@ torch._inductor.config.combo_kernel_foreach_dynamic_shapes = True
 
 YALIS_DISABLE_COMPILE = os.environ.get("YALIS_DISABLE_COMPILE", "0") == "1"
 
-YALIS_DECODE_MODE = (
-    "default"
-    if os.environ.get("YALIS_DISABLE_DECODE_CUDAGRAPHS", "0") == "1"
-    else "reduce-overhead"
-)
+_ALLOWED_COMPILE_MODES = {
+    "default",
+    "reduce-overhead",
+    "max-autotune",
+    "max-autotune-no-cudagraphs",
+}
+
+_decode_mode_env = os.environ.get("YALIS_DECODE_MODE")
+if _decode_mode_env is not None:
+    if _decode_mode_env not in _ALLOWED_COMPILE_MODES:
+        raise ValueError(
+            "Invalid YALIS_DECODE_MODE="
+            f"{_decode_mode_env}. Allowed values: "
+            f"{sorted(_ALLOWED_COMPILE_MODES)}"
+        )
+    YALIS_DECODE_MODE = _decode_mode_env
+else:
+    YALIS_DECODE_MODE = (
+        "default"
+        if os.environ.get("YALIS_DISABLE_DECODE_CUDAGRAPHS", "0") == "1"
+        else "reduce-overhead"
+    )
+
+YALIS_PREFILL_MODE = os.environ.get("YALIS_PREFILL_MODE", "default")
+if YALIS_PREFILL_MODE not in _ALLOWED_COMPILE_MODES:
+    raise ValueError(
+        "Invalid YALIS_PREFILL_MODE="
+        f"{YALIS_PREFILL_MODE}. Allowed values: "
+        f"{sorted(_ALLOWED_COMPILE_MODES)}"
+    )
 
 print(
     f"YALIS_DISABLE_COMPILE = {YALIS_DISABLE_COMPILE},"
+    f"YALIS_PREFILL_MODE = {YALIS_PREFILL_MODE},"
     f"YALIS_DECODE_MODE = {YALIS_DECODE_MODE}"
 )
 
@@ -58,7 +84,7 @@ precision_to_dtype = {
 
 
 @torch.inference_mode()
-@torch.compile(disable=YALIS_DISABLE_COMPILE)
+@torch.compile(mode=YALIS_PREFILL_MODE, disable=YALIS_DISABLE_COMPILE)
 def prefill(
     model,
     tokens,

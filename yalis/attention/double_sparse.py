@@ -155,8 +155,8 @@ def _double_sparse_prefill(
         sin = rotary_sin[:T][None, None, :, :]
         q, k = _apply_rope(q, k, cos, sin)
 
-    k_cache[:B, :, :T, :] = k
-    v_cache[:B, :, :T, :] = v
+    k_cache[:, :, :T, :] = k
+    v_cache[:, :, :T, :] = v
 
     heavy_channel_num = state["heavy_channel_num"]
     sorted_channel = state["sorted_channel"]
@@ -188,6 +188,7 @@ def _double_sparse_decode(
     state: dict,
     retain_perc: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    k_labels = state["k_label"]
     if rotary_cos is not None and rotary_sin is not None:
         cos = _index_into_rope_cache(rotary_cos, token_counter)
         sin = _index_into_rope_cache(rotary_sin, token_counter)
@@ -204,8 +205,6 @@ def _double_sparse_decode(
 
     heavy_channel_num = state["heavy_channel_num"]
     sorted_channel = state["sorted_channel"]
-    k_labels = state["k_label"]
-
     q_flat = q[:, :, 0, :].contiguous()
     q_label = torch.empty((B, q_heads, heavy_channel_num), device=q.device, dtype=q.dtype)
     get_label_tensor(q_flat, sorted_channel, q_label, heavy_channel_num)

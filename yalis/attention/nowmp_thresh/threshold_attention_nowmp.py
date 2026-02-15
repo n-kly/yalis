@@ -1,13 +1,15 @@
 from typing import Optional, Dict, Tuple
+import importlib
 import math
 import os
 import re
+import sys
 import torch
-from torch.utils.cpp_extension import load
 
 _BASE_DIR = os.path.dirname(__file__)
 _KERNEL_ENV = "YALIS_NOWMP_KERNEL"
 _DEFAULT_KERNEL = os.path.join(_BASE_DIR, "kernels", "thresh_attn_nowmp_cuda.cu")
+_EXT_DIR = os.path.join(_BASE_DIR, "_ext")
 _NOWMP_EXT = None
 
 BASE_CUTOFF = 128
@@ -40,12 +42,17 @@ def _load_nowmp_ext():
     if _NOWMP_EXT is not None:
         return _NOWMP_EXT
     kernel_source = _resolve_kernel_source()
-    _NOWMP_EXT = load(
-        name=_ext_name_from_kernel(kernel_source),
-        sources=[os.path.join(_BASE_DIR, "thresh_attn_nowmp_c.cpp"), kernel_source],
-        verbose=False,
-        extra_cuda_cflags=["-O3"],
-    )
+    ext_name = _ext_name_from_kernel(kernel_source)
+    if _EXT_DIR not in sys.path:
+        sys.path.append(_EXT_DIR)
+    try:
+        _NOWMP_EXT = importlib.import_module(ext_name)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"nowmp extension '{ext_name}' is not built. "
+            "Run `python scripts/build_nowmp_ext.py` from the repo root "
+            "and ensure YALIS_NOWMP_KERNEL (if set) matches the kernel you built."
+        ) from exc
     return _NOWMP_EXT
 
 

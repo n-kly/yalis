@@ -731,8 +731,30 @@ class CausalSelfAttention(nn.Module):
             (B, 1), device=x.device, dtype=torch.float32
         )
 
-        # NOTE: Pass full k_cache, v_cache, and token_counter.
-        # Slicing for current batch size is done in the respective backends.
+        # Slice per-batch state for dynamic batches (max_batch_size > B).
+        token_counter_slice = token_counter[:B]
+        generation_counter_slice = (
+            generation_counter[:B] if generation_counter is not None else None
+        )
+        warmup_quantiles = (
+            self.warmup_quantiles[:B] if self.warmup_quantiles is not None else None
+        )
+        powerlaw_a = self.powerlaw_a[:B] if self.powerlaw_a is not None else None
+        powerlaw_b = self.powerlaw_b[:B] if self.powerlaw_b is not None else None
+        nowmp_state = None
+        if self.nowmp_state is not None:
+            nowmp_state = {
+                key: value[:B] for key, value in self.nowmp_state.items()
+            }
+        double_sparse_state = None
+        if self.double_sparse_state is not None:
+            double_sparse_state = dict(self.double_sparse_state)
+            if "k_label" in double_sparse_state:
+                double_sparse_state["k_label"] = double_sparse_state["k_label"][:B]
+            if "attn_out" in double_sparse_state:
+                double_sparse_state["attn_out"] = double_sparse_state["attn_out"][:B]
+
+        # NOTE: Pass full k_cache, v_cache; batch slicing is handled via state.
         y = attention_wrapper(
             q=q,
             k_cache=k_cache,
@@ -740,7 +762,7 @@ class CausalSelfAttention(nn.Module):
             k=k,
             v=v,
             phase=phase,
-            cache_seqlens=token_counter,
+            cache_seqlens=token_counter_slice,
             block_table=block_table,
             rotary_cos=cos,
             rotary_sin=sin,
@@ -748,15 +770,15 @@ class CausalSelfAttention(nn.Module):
             use_intra_head_parallelism=self.config.use_intra_head_parallelism,
             prestore_kv_cache=self.config.prestore_kv_cache,
             flex_attention_block_mask=flex_attention_block_mask,
-            generation_counter=generation_counter,
-            warmup_quantiles=self.warmup_quantiles,
+            generation_counter=generation_counter_slice,
+            warmup_quantiles=warmup_quantiles,
             warmup=warmup,
             threshold_percentile=self.threshold_percentile,
             retain_perc=retain_perc,
-            powerlaw_a=self.powerlaw_a,
-            powerlaw_b=self.powerlaw_b,
-            nowmp_state=self.nowmp_state,
-            double_sparse_state=self.double_sparse_state,
+            powerlaw_a=powerlaw_a,
+            powerlaw_b=powerlaw_b,
+            nowmp_state=nowmp_state,
+            double_sparse_state=double_sparse_state,
         )
 
         if not self.config.attention_backend == AttentionBackend.FLASH:
